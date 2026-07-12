@@ -5,9 +5,12 @@ import {
   AlertTriangle, Wifi, WifiOff, PackageCheck, PackageX, Calendar, Download,
 } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 
 const SITE_PASSWORD = "Aditya";
 const AUTH_KEY = "st_card_authed";
+const CARD_PREFIX = "M260";
 
 const CATEGORIES = [
   { key: "female", label: "Female", icon: User, color: "#A6234A" },
@@ -19,7 +22,7 @@ const CATEGORIES = [
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
-const emptyForm = () => ({ name: "", mobile: "", cardNumber: "M", village: "", category: "female", date: todayStr() });
+const emptyForm = () => ({ name: "", mobile: "", cardNumber: CARD_PREFIX, village: "", category: "female", date: todayStr() });
 
 // Map DB row (snake_case) <-> app object (camelCase)
 const fromRow = (r) => ({
@@ -320,8 +323,9 @@ function CardRegister() {
 
   const handleCardNumberChange = (e) => {
     let v = e.target.value.toUpperCase();
-    // Strip any M's the user typed, then force a single leading M
-    v = "M" + v.replace(/M/g, "");
+    // Strip any occurrences of the prefix the user typed, then force
+    // exactly one at the very start — so it can never be deleted.
+    v = CARD_PREFIX + v.split(CARD_PREFIX).join("");
     setForm((f) => ({ ...f, cardNumber: v }));
   };
 
@@ -521,11 +525,15 @@ function CardRegister() {
             {CATEGORIES.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
           </select>
           <button
-            onClick={() => exportCustomersCSV(customers, (key) => catMeta(key).label)}
-            title="Export all customers to a spreadsheet file"
+            onClick={() => {
+              const data = filterVillage === "all" ? customers : customers.filter((c) => c.village === filterVillage);
+              const title = filterVillage === "all" ? "All Villages" : filterVillage;
+              exportCustomersPDF(data, title, (key) => catMeta(key).label);
+            }}
+            title={filterVillage === "all" ? "Export all customers to a PDF" : `Export only ${filterVillage} to a PDF`}
             style={{ display: "flex", alignItems: "center", gap: 6, padding: "10px 14px", borderRadius: 10, border: "1px solid #DED2C0", background: "#fff", color: "#2B2117", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}
           >
-            <Download size={15} /> Export
+            <Download size={15} /> {filterVillage === "all" ? "Export all" : `Export ${filterVillage}`}
           </button>
         </div>
 
@@ -649,7 +657,7 @@ function CardRegister() {
             </Field>
 
             <Field label="Card number" error={errors.cardNumber}>
-              <input value={form.cardNumber} onChange={handleCardNumberChange} placeholder="e.g. M00123" style={inputStyle(errors.cardNumber)} />
+              <input value={form.cardNumber} onChange={handleCardNumberChange} placeholder="e.g. M26000123" style={inputStyle(errors.cardNumber)} />
             </Field>
 
             <Field label="Date" error={errors.date}>
@@ -748,8 +756,16 @@ function formatDisplayDate(iso) {
   return `${d}/${m}/${y}`;
 }
 
-function exportCustomersCSV(customers, catLabel) {
-  const header = ["Date", "Name", "Card Number", "Contact Number", "Village", "Category", "Delivered"];
+function exportCustomersPDF(customers, title, catLabel) {
+  const doc = new jsPDF({ orientation: "landscape" });
+
+  doc.setFontSize(15);
+  doc.text(`ST Card Register — ${title}`, 14, 15);
+  doc.setFontSize(10);
+  doc.setTextColor(110, 100, 90);
+  const dateStr = new Date().toLocaleDateString("en-IN");
+  doc.text(`Generated ${dateStr} · ${customers.length} customer${customers.length === 1 ? "" : "s"}`, 14, 21);
+
   const rows = customers.map((c) => [
     c.date ? formatDisplayDate(c.date) : "",
     c.name || "",
@@ -759,20 +775,18 @@ function exportCustomersCSV(customers, catLabel) {
     catLabel(c.category),
     c.delivered ? "Yes" : "No",
   ]);
-  const escape = (val) => {
-    const s = String(val ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const csv = [header, ...rows].map((r) => r.map(escape).join(",")).join("\n");
-  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `st-card-customers-${new Date().toISOString().slice(0, 10)}.csv`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+
+  autoTable(doc, {
+    startY: 26,
+    head: [["Date", "Name", "Card Number", "Contact Number", "Village", "Category", "Delivered"]],
+    body: rows,
+    styles: { fontSize: 9, cellPadding: 3 },
+    headStyles: { fillColor: [139, 26, 26], textColor: [255, 255, 255] },
+    alternateRowStyles: { fillColor: [245, 241, 232] },
+  });
+
+  const safeTitle = title.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  doc.save(`st-card-customers-${safeTitle}-${new Date().toISOString().slice(0, 10)}.pdf`);
 }
 
 function Field({ label, error, children }) {
