@@ -1,8 +1,8 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Search, Plus, Pencil, Trash2, X, Users, User, GraduationCap,
   Accessibility, Bus, MapPin, Phone, CreditCard, Heart, Sparkles,
-  AlertTriangle, Wifi, WifiOff, PackageCheck, PackageX,
+  AlertTriangle, Wifi, WifiOff, PackageCheck, PackageX, Calendar, Download,
 } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
 
@@ -17,7 +17,9 @@ const CATEGORIES = [
   { key: "amrut", label: "Amrut SCT", icon: Sparkles, color: "#C1622D" },
 ];
 
-const emptyForm = { name: "", mobile: "", cardNumber: "", village: "", category: "female" };
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+const emptyForm = () => ({ name: "", mobile: "", cardNumber: "M", village: "", category: "female", date: todayStr() });
 
 // Map DB row (snake_case) <-> app object (camelCase)
 const fromRow = (r) => ({
@@ -28,6 +30,7 @@ const fromRow = (r) => ({
   village: r.village,
   category: r.category,
   delivered: r.delivered,
+  date: r.entry_date,
   createdAt: r.created_at,
 });
 const toRow = (c) => ({
@@ -36,6 +39,7 @@ const toRow = (c) => ({
   card_number: c.cardNumber,
   village: c.village,
   category: c.category,
+  entry_date: c.date,
 });
 
 export default function App() {
@@ -90,6 +94,7 @@ function PasswordGate({ onSuccess }) {
 
 function CardRegister() {
   const [customers, setCustomers] = useState([]);
+  const [villages, setVillages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [online, setOnline] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -98,10 +103,14 @@ function CardRegister() {
   const [search, setSearch] = useState("");
   const [filterCategory, setFilterCategory] = useState("all");
   const [filterDelivery, setFilterDelivery] = useState("all");
+  const [filterVillage, setFilterVillage] = useState("all");
+  const [addingVillage, setAddingVillage] = useState(false);
+  const [newVillageName, setNewVillageName] = useState("");
   const [errors, setErrors] = useState({});
   const [toast, setToast] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [saving, setSaving] = useState(false);
+  const nameInputRef = useRef(null);
 
   const showToast = (msg, isError = false) => {
     setToast({ msg, isError });
@@ -123,28 +132,50 @@ function CardRegister() {
     setLoading(false);
   }, []);
 
+  const fetchVillages = useCallback(async () => {
+    const { data, error } = await supabase.from("villages").select("*").order("name", { ascending: true });
+    if (!error) setVillages(data || []);
+  }, []);
+
+  const addVillage = useCallback(async (rawName) => {
+    const name = rawName.trim().toUpperCase();
+    if (!name) return false;
+    const { error } = await supabase.from("villages").insert({ name });
+    if (error && error.code !== "23505") {
+      // 23505 = already exists, which is fine — just means it's already usable
+      showToast("Could not add village", true);
+      return false;
+    }
+    fetchVillages();
+    return true;
+  }, [fetchVillages]);
+
   useEffect(() => {
     fetchCustomers();
+    fetchVillages();
     const channel = supabase
       .channel("customers-changes")
       .on("postgres_changes", { event: "*", schema: "public", table: "customers" }, () => {
         fetchCustomers();
       })
+      .on("postgres_changes", { event: "*", schema: "public", table: "villages" }, () => {
+        fetchVillages();
+      })
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [fetchCustomers]);
+  }, [fetchCustomers, fetchVillages]);
 
   const openAddForm = () => {
-    setForm(emptyForm);
+    setForm({ ...emptyForm(), village: filterVillage !== "all" ? filterVillage : "" });
     setErrors({});
     setEditingId(null);
     setShowForm(true);
   };
 
   const openEditForm = (c) => {
-    setForm({ name: c.name, mobile: c.mobile, cardNumber: c.cardNumber, village: c.village, category: c.category });
+    setForm({ name: c.name, mobile: c.mobile, cardNumber: c.cardNumber, village: c.village, category: c.category, date: c.date || todayStr() });
     setErrors({});
     setEditingId(c.id);
     setShowForm(true);
@@ -157,6 +188,7 @@ function CardRegister() {
     else if (!/^\d{10}$/.test(form.mobile.trim())) e.mobile = "Enter 10-digit number";
     if (!form.cardNumber.trim()) e.cardNumber = "Card number required";
     if (!form.village.trim()) e.village = "Village required";
+    if (!form.date) e.date = "Date required";
     setErrors(e);
     return Object.keys(e).length === 0;
   };
@@ -164,7 +196,7 @@ function CardRegister() {
   const handleSubmit = async () => {
     if (!validate()) return;
     setSaving(true);
-    const payload = { ...form, name: form.name.trim(), village: form.village.trim() };
+    const payload = { ...form, name: form.name.trim().toUpperCase(), village: form.village.trim().toUpperCase() };
 
     if (editingId) {
       const { error } = await supabase.from("customers").update(toRow(payload)).eq("id", editingId);
@@ -190,6 +222,9 @@ function CardRegister() {
     setForm(emptyForm);
     setEditingId(null);
     fetchCustomers();
+    if (!villages.some((v) => v.name === payload.village)) {
+      addVillage(payload.village);
+    }
   };
 
   const handleDelete = async (id) => {
@@ -216,9 +251,84 @@ function CardRegister() {
     }
   };
 
+  const markLatestDelivered = async () => {
+    if (customers.length === 0) return;
+    const latest = customers[0]; // list is sorted newest-first
+    if (latest.delivered) {
+      showToast("Latest customer is already marked delivered");
+      return;
+    }
+    setCustomers((prev) => prev.map((x) => (x.id === latest.id ? { ...x, delivered: true } : x)));
+    const { error } = await supabase.from("customers").update({ delivered: true }).eq("id", latest.id);
+    if (error) {
+      setCustomers((prev) => prev.map((x) => (x.id === latest.id ? { ...x, delivered: false } : x)));
+      showToast("Could not update delivery status", true);
+    } else {
+      showToast(`${latest.name} marked delivered`);
+    }
+  };
+
+  // Keyboard shortcuts: Ctrl+N (or Cmd+N) = add new customer,
+  // Ctrl+D (or Cmd+D) = mark the most recently added customer delivered,
+  // Ctrl+S (or Cmd+S) = save the open form.
+  // Note: some desktop browsers (esp. Chrome) permanently reserve Ctrl+N and
+  // Ctrl+D for their own use (new window / bookmark) and never let a webpage
+  // override them. So this app supports three ways in, whichever works on
+  // your browser: Ctrl+N/Ctrl+D, Alt+N/Alt+D, or just pressing N / D alone
+  // (only when you're not typing in a text field).
+  useEffect(() => {
+    const isTypingField = (el) =>
+      el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+
+    const handler = (e) => {
+      const key = e.key.toLowerCase();
+      const ctrlOrCmd = e.ctrlKey || e.metaKey;
+      const alt = e.altKey;
+      const bareKey = !ctrlOrCmd && !alt && !isTypingField(e.target);
+
+      if (ctrlOrCmd && key === "s") {
+        e.preventDefault();
+        if (showForm) handleSubmit();
+        return;
+      }
+
+      const wantsNew = (ctrlOrCmd && key === "n") || (alt && key === "n") || (bareKey && key === "n");
+      const wantsDelivered = (ctrlOrCmd && key === "d") || (alt && key === "d") || (bareKey && key === "d");
+
+      if (wantsNew) {
+        e.preventDefault();
+        if (!showForm) openAddForm();
+      } else if (wantsDelivered) {
+        e.preventDefault();
+        if (!showForm) markLatestDelivered();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  });
+
+  // Autofocus the "Full name" field whenever the form opens
+  useEffect(() => {
+    if (showForm && nameInputRef.current) {
+      const t = setTimeout(() => {
+        nameInputRef.current.focus();
+        nameInputRef.current.select();
+      }, 50);
+      return () => clearTimeout(t);
+    }
+  }, [showForm]);
+
+  const handleCardNumberChange = (e) => {
+    let v = e.target.value.toUpperCase();
+    // Strip any M's the user typed, then force a single leading M
+    v = "M" + v.replace(/M/g, "");
+    setForm((f) => ({ ...f, cardNumber: v }));
+  };
+
   const filtered = useMemo(() => {
     return customers.filter((c) => {
       const matchesCat = filterCategory === "all" || c.category === filterCategory;
+      const matchesVillage = filterVillage === "all" || c.village === filterVillage;
       const matchesDelivery =
         filterDelivery === "all" ||
         (filterDelivery === "delivered" && c.delivered) ||
@@ -230,9 +340,9 @@ function CardRegister() {
         c.mobile.includes(q) ||
         c.cardNumber.toLowerCase().includes(q) ||
         c.village.toLowerCase().includes(q);
-      return matchesCat && matchesDelivery && matchesSearch;
+      return matchesCat && matchesVillage && matchesDelivery && matchesSearch;
     });
-  }, [customers, search, filterCategory, filterDelivery]);
+  }, [customers, search, filterCategory, filterVillage, filterDelivery]);
 
   const counts = useMemo(() => {
     const c = {};
@@ -241,7 +351,30 @@ function CardRegister() {
     return c;
   }, [customers]);
 
+  const villageCounts = useMemo(() => {
+    const c = {};
+    customers.forEach((cu) => { c[cu.village] = (c[cu.village] || 0) + 1; });
+    return c;
+  }, [customers]);
+
+  // Combine explicitly-added villages with any village names already used
+  // by customers, so nothing is missing from the list either way.
+  const allVillageNames = useMemo(() => {
+    const names = new Set(villages.map((v) => v.name));
+    customers.forEach((c) => { if (c.village) names.add(c.village); });
+    return Array.from(names).sort();
+  }, [villages, customers]);
+
   const catMeta = (key) => CATEGORIES.find((c) => c.key === key) || CATEGORIES[0];
+
+  const handleAddVillage = async () => {
+    const ok = await addVillage(newVillageName);
+    if (ok) {
+      showToast("Village added");
+      setNewVillageName("");
+      setAddingVillage(false);
+    }
+  };
 
   return (
     <div style={{ minHeight: "100vh", background: "#F5F1E8", fontFamily: "'Inter', system-ui, sans-serif", color: "#2B2117", paddingBottom: 90 }}>
@@ -267,6 +400,7 @@ function CardRegister() {
           <div style={{ flex: 1 }}>
             <h1 style={{ margin: 0, fontSize: 19, fontWeight: 700, letterSpacing: -0.2 }}>ST Card Register</h1>
             <p style={{ margin: 0, fontSize: 12.5, color: "#EAD9CE", opacity: 0.9 }}>Maharashtra State Transport · Card holder records</p>
+            <p style={{ margin: "2px 0 0", fontSize: 10.5, color: "#EAD9CE", opacity: 0.7 }}>N new · D mark latest delivered · Ctrl+S save form</p>
           </div>
           <div title={online ? "Synced" : "Offline"} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#EAD9CE" }}>
             {online ? <Wifi size={15} /> : <WifiOff size={15} />}
@@ -302,6 +436,72 @@ function CardRegister() {
           })}
         </div>
 
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: "#6B5D4F", marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
+            <MapPin size={13} /> Villages
+          </div>
+          <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4 }}>
+            <button
+              onClick={() => setFilterVillage("all")}
+              style={{
+                flexShrink: 0, padding: "7px 14px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+                border: filterVillage === "all" ? "1px solid #8B1A1A" : "1px solid #DED2C0",
+                background: filterVillage === "all" ? "#8B1A1A" : "#fff",
+                color: filterVillage === "all" ? "#fff" : "#6B5D4F",
+              }}
+            >
+              All ({customers.length})
+            </button>
+            {allVillageNames.map((name) => {
+              const active = filterVillage === name;
+              return (
+                <button
+                  key={name}
+                  onClick={() => setFilterVillage(active ? "all" : name)}
+                  style={{
+                    flexShrink: 0, padding: "7px 14px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+                    border: active ? "1px solid #8B1A1A" : "1px solid #DED2C0",
+                    background: active ? "#8B1A1A" : "#fff",
+                    color: active ? "#fff" : "#6B5D4F",
+                  }}
+                >
+                  {name} ({villageCounts[name] || 0})
+                </button>
+              );
+            })}
+            {!addingVillage ? (
+              <button
+                onClick={() => setAddingVillage(true)}
+                style={{ flexShrink: 0, padding: "7px 14px", borderRadius: 20, fontSize: 12.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", border: "1px dashed #8B1A1A", background: "#fff", color: "#8B1A1A" }}
+              >
+                + Add village
+              </button>
+            ) : (
+              <div style={{ display: "flex", gap: 4, alignItems: "center", flexShrink: 0 }}>
+                <input
+                  autoFocus
+                  value={newVillageName}
+                  onChange={(e) => setNewVillageName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleAddVillage()}
+                  placeholder="Village name"
+                  style={{ width: 140, padding: "7px 10px", borderRadius: 20, border: "1px solid #DED2C0", fontSize: 12.5 }}
+                />
+                <button onClick={handleAddVillage} style={{ border: "none", background: "#8B1A1A", color: "#fff", borderRadius: "50%", width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }} aria-label="Save village">
+                  <Plus size={14} />
+                </button>
+                <button onClick={() => { setAddingVillage(false); setNewVillageName(""); }} style={{ border: "none", background: "#F5F1E8", borderRadius: "50%", width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }} aria-label="Cancel">
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+          </div>
+          {filterVillage !== "all" && (
+            <div style={{ fontSize: 11.5, color: "#9A8B7A", marginTop: 6 }}>
+              Showing {filterVillage}. Tap the + button below to add a customer here directly.
+            </div>
+          )}
+        </div>
+
         <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
           <div style={{ position: "relative", flex: "1 1 200px" }}>
             <Search size={16} style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "#9A8B7A" }} />
@@ -320,6 +520,13 @@ function CardRegister() {
             <option value="all">All categories</option>
             {CATEGORIES.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
           </select>
+          <button
+            onClick={() => exportCustomersCSV(customers, (key) => catMeta(key).label)}
+            title="Export all customers to a spreadsheet file"
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "10px 14px", borderRadius: 10, border: "1px solid #DED2C0", background: "#fff", color: "#2B2117", fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}
+          >
+            <Download size={15} /> Export
+          </button>
         </div>
 
         <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
@@ -383,6 +590,7 @@ function CardRegister() {
                       <span style={{ display: "flex", alignItems: "center", gap: 3 }}><CreditCard size={11}/> {c.cardNumber}</span>
                       <span style={{ display: "flex", alignItems: "center", gap: 3 }}><Phone size={11}/> {c.mobile}</span>
                       <span style={{ display: "flex", alignItems: "center", gap: 3 }}><MapPin size={11}/> {c.village}</span>
+                      {c.date && <span style={{ display: "flex", alignItems: "center", gap: 3 }}><Calendar size={11}/> {formatDisplayDate(c.date)}</span>}
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
@@ -433,7 +641,7 @@ function CardRegister() {
             </div>
 
             <Field label="Full name" error={errors.name}>
-              <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Kirti Patil" style={inputStyle(errors.name)} />
+              <input ref={nameInputRef} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. KIRTI PATIL" style={inputStyle(errors.name)} />
             </Field>
 
             <Field label="Mobile number" error={errors.mobile}>
@@ -441,11 +649,24 @@ function CardRegister() {
             </Field>
 
             <Field label="Card number" error={errors.cardNumber}>
-              <input value={form.cardNumber} onChange={(e) => setForm({ ...form, cardNumber: e.target.value })} placeholder="e.g. ST-2026-00123" style={inputStyle(errors.cardNumber)} />
+              <input value={form.cardNumber} onChange={handleCardNumberChange} placeholder="e.g. M00123" style={inputStyle(errors.cardNumber)} />
+            </Field>
+
+            <Field label="Date" error={errors.date}>
+              <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} style={inputStyle(errors.date)} />
             </Field>
 
             <Field label="Village" error={errors.village}>
-              <input value={form.village} onChange={(e) => setForm({ ...form, village: e.target.value })} placeholder="e.g. Wadgaon" style={inputStyle(errors.village)} />
+              <input
+                value={form.village}
+                onChange={(e) => setForm({ ...form, village: e.target.value })}
+                placeholder="Start typing or pick a saved village"
+                list="village-options"
+                style={inputStyle(errors.village)}
+              />
+              <datalist id="village-options">
+                {allVillageNames.map((name) => <option key={name} value={name} />)}
+              </datalist>
             </Field>
 
             <Field label="Category">
@@ -518,6 +739,40 @@ function SetupNeeded() {
       </div>
     </div>
   );
+}
+
+function formatDisplayDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  if (!y || !m || !d) return iso;
+  return `${d}/${m}/${y}`;
+}
+
+function exportCustomersCSV(customers, catLabel) {
+  const header = ["Date", "Name", "Card Number", "Contact Number", "Village", "Category", "Delivered"];
+  const rows = customers.map((c) => [
+    c.date ? formatDisplayDate(c.date) : "",
+    c.name || "",
+    c.cardNumber || "",
+    c.mobile || "",
+    c.village || "",
+    catLabel(c.category),
+    c.delivered ? "Yes" : "No",
+  ]);
+  const escape = (val) => {
+    const s = String(val ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [header, ...rows].map((r) => r.map(escape).join(",")).join("\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `st-card-customers-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function Field({ label, error, children }) {
