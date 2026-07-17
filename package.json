@@ -14,7 +14,8 @@
     "jspdf-autotable": "^3.8.4",
     "lucide-react": "^0.383.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.1",

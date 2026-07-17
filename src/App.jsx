@@ -3,10 +3,12 @@ import {
   Search, Plus, Pencil, Trash2, X, Users, User, GraduationCap,
   Accessibility, Bus, MapPin, Phone, CreditCard, Heart, Sparkles,
   AlertTriangle, Wifi, WifiOff, PackageCheck, PackageX, Calendar, Download,
+  Camera, ImagePlus, ScanLine, Loader2, CheckCircle2,
 } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./supabaseClient";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import { parseCardText } from "./cardScan";
 
 const SITE_PASSWORD = "Aditya";
 const AUTH_KEY = "st_card_authed";
@@ -114,6 +116,11 @@ function CardRegister() {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [saving, setSaving] = useState(false);
   const nameInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const galleryInputRef = useRef(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanPct, setScanPct] = useState(0);
+  const [scanFilled, setScanFilled] = useState(null); // which fields got auto-filled, e.g. {name:true, mobile:false, ...}
 
   const showToast = (msg, isError = false) => {
     setToast({ msg, isError });
@@ -174,6 +181,7 @@ function CardRegister() {
     setForm({ ...emptyForm(), village: filterVillage !== "all" ? filterVillage : "" });
     setErrors({});
     setEditingId(null);
+    setScanFilled(null);
     setShowForm(true);
   };
 
@@ -181,6 +189,7 @@ function CardRegister() {
     setForm({ name: c.name, mobile: c.mobile, cardNumber: c.cardNumber, village: c.village, category: c.category, date: c.date || todayStr() });
     setErrors({});
     setEditingId(c.id);
+    setScanFilled(null);
     setShowForm(true);
   };
 
@@ -321,6 +330,44 @@ function CardRegister() {
     }
   }, [showForm]);
 
+  const handleScanImage = async (file) => {
+    if (!file) return;
+    setScanning(true);
+    setScanPct(0);
+    setScanFilled(null);
+    try {
+      const Tesseract = await import("tesseract.js");
+      const { data } = await Tesseract.recognize(file, "eng", {
+        logger: (m) => {
+          if (m.status === "recognizing text" && typeof m.progress === "number") {
+            setScanPct(Math.round(m.progress * 100));
+          }
+        },
+      });
+      const parsed = parseCardText(data.text, CARD_PREFIX);
+      const filled = {};
+      setForm((f) => {
+        const next = { ...f };
+        if (parsed.name) { next.name = parsed.name.toUpperCase(); filled.name = true; }
+        if (parsed.mobile) { next.mobile = parsed.mobile; filled.mobile = true; }
+        if (parsed.cardNumber) { next.cardNumber = parsed.cardNumber; filled.cardNumber = true; }
+        if (parsed.village) { next.village = parsed.village.toUpperCase(); filled.village = true; }
+        if (parsed.category) { next.category = parsed.category; filled.category = true; }
+        return next;
+      });
+      setScanFilled(filled);
+      if (Object.keys(filled).length === 0) {
+        showToast("Couldn't read details from that image — please fill in manually", true);
+      } else {
+        showToast("Scanned — please check the highlighted fields below");
+      }
+    } catch (err) {
+      showToast("Scan failed — please fill in manually", true);
+    } finally {
+      setScanning(false);
+    }
+  };
+
   const handleCardNumberChange = (e) => {
     let v = e.target.value.toUpperCase();
     // Strip any occurrences of the prefix the user typed, then force
@@ -394,6 +441,8 @@ function CardRegister() {
         @keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
         .fade-in { animation: fadeIn 0.2s ease-out; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .spin { animation: spin 0.9s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
 
       <header style={{ background: "#8B1A1A", color: "#F5F1E8", padding: "20px 16px 24px" }}>
@@ -648,16 +697,82 @@ function CardRegister() {
               </button>
             </div>
 
+            <div style={{ background: "#fff", border: "1px dashed #DED2C0", borderRadius: 12, padding: 12, marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 700, color: "#6B5D4F", marginBottom: 8 }}>
+                <ScanLine size={14} /> Scan card to auto-fill (optional)
+              </div>
+              <input
+                ref={cameraInputRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                style={{ display: "none" }}
+                onChange={(e) => { handleScanImage(e.target.files?.[0]); e.target.value = ""; }}
+              />
+              <input
+                ref={galleryInputRef}
+                type="file"
+                accept="image/*"
+                style={{ display: "none" }}
+                onChange={(e) => { handleScanImage(e.target.files?.[0]); e.target.value = ""; }}
+              />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  disabled={scanning}
+                  onClick={() => cameraInputRef.current?.click()}
+                  style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "10px", borderRadius: 10, border: "1px solid #DED2C0", background: "#F5F1E8", fontSize: 13, fontWeight: 600, color: "#2B2117", cursor: scanning ? "default" : "pointer", opacity: scanning ? 0.6 : 1 }}
+                >
+                  <Camera size={16} /> Take photo
+                </button>
+                <button
+                  type="button"
+                  disabled={scanning}
+                  onClick={() => galleryInputRef.current?.click()}
+                  style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "10px", borderRadius: 10, border: "1px solid #DED2C0", background: "#F5F1E8", fontSize: 13, fontWeight: 600, color: "#2B2117", cursor: scanning ? "default" : "pointer", opacity: scanning ? 0.6 : 1 }}
+                >
+                  <ImagePlus size={16} /> Upload image
+                </button>
+              </div>
+              {scanning && (
+                <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#6B5D4F" }}>
+                  <Loader2 size={14} className="spin" /> Reading image… {scanPct}%
+                </div>
+              )}
+              {!scanning && scanFilled && Object.keys(scanFilled).length > 0 && (
+                <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#2F7A4F" }}>
+                  <CheckCircle2 size={14} /> Auto-filled below — double-check before saving.
+                </div>
+              )}
+            </div>
+
             <Field label="Full name" error={errors.name}>
-              <input ref={nameInputRef} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. KIRTI PATIL" style={inputStyle(errors.name)} />
+              <input
+                ref={nameInputRef}
+                value={form.name}
+                onChange={(e) => { setForm({ ...form, name: e.target.value }); setScanFilled((s) => (s ? { ...s, name: false } : s)); }}
+                placeholder="e.g. KIRTI PATIL"
+                style={{ ...inputStyle(errors.name), ...(scanFilled?.name ? scannedFieldStyle : {}) }}
+              />
             </Field>
 
             <Field label="Mobile number" error={errors.mobile}>
-              <input value={form.mobile} onChange={(e) => setForm({ ...form, mobile: e.target.value.replace(/\D/g, "").slice(0, 10) })} placeholder="10-digit number" inputMode="numeric" style={inputStyle(errors.mobile)} />
+              <input
+                value={form.mobile}
+                onChange={(e) => { setForm({ ...form, mobile: e.target.value.replace(/\D/g, "").slice(0, 10) }); setScanFilled((s) => (s ? { ...s, mobile: false } : s)); }}
+                placeholder="10-digit number"
+                inputMode="numeric"
+                style={{ ...inputStyle(errors.mobile), ...(scanFilled?.mobile ? scannedFieldStyle : {}) }}
+              />
             </Field>
 
             <Field label="Card number" error={errors.cardNumber}>
-              <input value={form.cardNumber} onChange={handleCardNumberChange} placeholder="e.g. M26000123" style={inputStyle(errors.cardNumber)} />
+              <input
+                value={form.cardNumber}
+                onChange={(e) => { handleCardNumberChange(e); setScanFilled((s) => (s ? { ...s, cardNumber: false } : s)); }}
+                placeholder="e.g. M26000123"
+                style={{ ...inputStyle(errors.cardNumber), ...(scanFilled?.cardNumber ? scannedFieldStyle : {}) }}
+              />
             </Field>
 
             <Field label="Date" error={errors.date}>
@@ -667,10 +782,10 @@ function CardRegister() {
             <Field label="Village" error={errors.village}>
               <input
                 value={form.village}
-                onChange={(e) => setForm({ ...form, village: e.target.value })}
+                onChange={(e) => { setForm({ ...form, village: e.target.value }); setScanFilled((s) => (s ? { ...s, village: false } : s)); }}
                 placeholder="Start typing or pick a saved village"
                 list="village-options"
-                style={inputStyle(errors.village)}
+                style={{ ...inputStyle(errors.village), ...(scanFilled?.village ? scannedFieldStyle : {}) }}
               />
               <datalist id="village-options">
                 {allVillageNames.map((name) => <option key={name} value={name} />)}
@@ -686,10 +801,10 @@ function CardRegister() {
                     <button
                       key={cat.key}
                       type="button"
-                      onClick={() => setForm({ ...form, category: cat.key })}
+                      onClick={() => { setForm({ ...form, category: cat.key }); setScanFilled((s) => (s ? { ...s, category: false } : s)); }}
                       style={{
                         display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10,
-                        border: active ? `2px solid ${cat.color}` : "1px solid #DED2C0",
+                        border: active ? `2px solid ${cat.color}` : (scanFilled?.category && active ? "2px solid #2F7A4F" : "1px solid #DED2C0"),
                         background: active ? cat.color + "14" : "#fff", cursor: "pointer", fontSize: 13.5, fontWeight: active ? 700 : 500,
                         color: active ? cat.color : "#2B2117",
                       }}
@@ -798,6 +913,8 @@ function Field({ label, error, children }) {
     </div>
   );
 }
+
+const scannedFieldStyle = { borderColor: "#2F7A4F", background: "#F1F8F3" };
 
 function inputStyle(error) {
   return {
