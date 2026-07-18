@@ -963,6 +963,23 @@ function CardRegister() {
             </Field>
 
             <Field label="Village" error={errors.village}>
+              {villageCandidates.length > 1 && (
+                <select
+                  value={villageCandidates.some((v) => v.toUpperCase() === form.village) ? form.village : ""}
+                  onChange={(e) => {
+                    if (!e.target.value) return;
+                    setForm({ ...form, village: e.target.value });
+                    setScanFilled((s) => (s ? { ...s, village: true } : s));
+                    setPincodeStatus("done");
+                  }}
+                  style={{ ...inputStyle(null), marginBottom: 8, fontWeight: 600, borderColor: "#B8860B", background: "#FFF9EE" }}
+                >
+                  <option value="">{villageCandidates.length} villages share this pincode — tap to pick one</option>
+                  {villageCandidates.map((v) => (
+                    <option key={v} value={v.toUpperCase()}>{v}</option>
+                  ))}
+                </select>
+              )}
               <input
                 value={form.village}
                 onChange={(e) => { setForm({ ...form, village: e.target.value }); setScanFilled((s) => (s ? { ...s, village: false } : s)); }}
