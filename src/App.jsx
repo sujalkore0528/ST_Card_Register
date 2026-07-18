@@ -9,16 +9,11 @@ import { supabase, isSupabaseConfigured } from "./supabaseClient";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import { parseCardText } from "./cardScan";
+import { lookupPincode, getPincodeSet, pickBestVillage } from "./pincodeLookup";
 
 const SITE_PASSWORD = "Aditya";
 const AUTH_KEY = "st_card_authed";
 const CARD_PREFIX = "M260";
-
-// India Post Pincode Directory (data.gov.in). Used to auto-fill the village
-// / post-office name from a 6-digit pincode. Move the key into a
-// VITE_PINCODE_API_KEY env var if you'd rather not hardcode it.
-const PINCODE_API_KEY = import.meta.env.VITE_PINCODE_API_KEY || "579b464db66ec23bdd000001abe41a64981543907e01c0dbf7dac1c3";
-const PINCODE_RESOURCE_ID = "6176ee09-3d56-4a3b-8115-21841576b2f6";
 
 const CATEGORIES = [
   { key: "female", label: "Female", icon: User, color: "#A6234A" },
@@ -127,7 +122,9 @@ function CardRegister() {
   const [scanning, setScanning] = useState(false);
   const [scanPct, setScanPct] = useState(0);
   const [scanFilled, setScanFilled] = useState(null); // which fields got auto-filled, e.g. {name:true, mobile:false, ...}
-  const [pincodeStatus, setPincodeStatus] = useState(null); // null | 'loading' | 'done' | 'error'
+  const [pincodeStatus, setPincodeStatus] = useState(null); // null | 'loading' | 'done' | 'multiple' | 'error'
+  const [villageCandidates, setVillageCandidates] = useState([]); // villages sharing the current pincode, when more than one
+  const ocrVillageGuessRef = useRef(""); // village text (if any) the OCR pass read off the card, used to disambiguate
   const [showScanMenu, setShowScanMenu] = useState(false); // front-page quick-scan popover
 
   const showToast = (msg, isError = false) => {
@@ -191,6 +188,8 @@ function CardRegister() {
     setEditingId(null);
     setScanFilled(null);
     setPincodeStatus(null);
+    setVillageCandidates([]);
+    ocrVillageGuessRef.current = "";
     setShowForm(true);
   };
 
@@ -200,6 +199,8 @@ function CardRegister() {
     setEditingId(c.id);
     setScanFilled(null);
     setPincodeStatus(null);
+    setVillageCandidates([]);
+    ocrVillageGuessRef.current = "";
     setShowForm(true);
   };
 
@@ -340,21 +341,77 @@ function CardRegister() {
     }
   }, [showForm]);
 
+  // Large phone-camera photos (often 8-12MB, 4000px+ on a side) are a common
+  // cause of the scanner silently failing or hanging on low-end Android
+  // phones — the OCR engine runs entirely in-browser via WebAssembly, and
+  // feeding it a huge image can exhaust memory or simply take too long.
+  // Downscaling to a sane max dimension first fixes that and also makes
+  // recognition noticeably faster.
+  const downscaleImage = (file, maxDimension = 1600) =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const scale = Math.min(1, maxDimension / Math.max(img.width, img.height));
+        if (scale === 1) {
+          resolve(file);
+          return;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => (blob ? resolve(blob) : resolve(file)),
+          "image/jpeg",
+          0.9
+        );
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(file); // fall back to the original file rather than failing the whole scan
+      };
+      img.src = url;
+    });
+
   const handleScanImage = async (file) => {
     if (!file) return;
     setScanning(true);
     setScanPct(0);
     setScanFilled(null);
     try {
-      const Tesseract = await import("tesseract.js");
-      const { data } = await Tesseract.recognize(file, "eng", {
+      const [Tesseract, resized, pincodeSet] = await Promise.all([
+        import("tesseract.js"),
+        downscaleImage(file),
+        getPincodeSet().catch(() => new Set()),
+      ]);
+
+      const recognizePromise = Tesseract.recognize(resized, "eng", {
+        // Pinned to a version compatible with tesseract.js@5.1.1 so the
+        // worker/core/traineddata fetched from the CDN never mismatch —
+        // a mismatch is the most common cause of the scanner failing with
+        // no useful error message.
+        workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+        corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.0/tesseract-core-simd-lstm.wasm.js",
+        langPath: "https://tessdata.projectnaptha.com/4.0.0",
         logger: (m) => {
           if (m.status === "recognizing text" && typeof m.progress === "number") {
             setScanPct(Math.round(m.progress * 100));
           }
         },
       });
-      const parsed = parseCardText(data.text, CARD_PREFIX);
+      // If the CDN is unreachable (weak signal, captive portal, etc.) the
+      // worker can hang indefinitely instead of rejecting — cap it so the
+      // person gets a clear "try again" message instead of a frozen screen.
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Scan timed out — check your internet connection and try again")), 45000)
+      );
+      const { data } = await Promise.race([recognizePromise, timeoutPromise]);
+
+      const parsed = parseCardText(data.text, CARD_PREFIX, pincodeSet);
+      ocrVillageGuessRef.current = parsed.village || "";
       const filled = {};
       setForm((f) => {
         const next = { ...f };
@@ -363,7 +420,8 @@ function CardRegister() {
         if (parsed.cardNumber) { next.cardNumber = parsed.cardNumber; filled.cardNumber = true; }
         if (parsed.pincode) {
           // A pincode was found on the card — let the pincode lookup effect
-          // fetch the official village/post-office name for it.
+          // fetch the official village name for it (cross-checked against
+          // parsed.village above when more than one village shares it).
           next.pincode = parsed.pincode;
           filled.pincode = true;
         } else if (parsed.village) {
@@ -380,47 +438,54 @@ function CardRegister() {
         showToast("Scanned — please check the highlighted fields below");
       }
     } catch (err) {
-      showToast("Scan failed — please fill in manually", true);
+      console.error("Card scan failed:", err);
+      showToast(err?.message?.includes("timed out") ? err.message : "Scan failed — please fill in manually", true);
     } finally {
       setScanning(false);
     }
   };
 
-  // Look up the village / post-office name from a 6-digit pincode using the
-  // India Post Pincode Directory (data.gov.in). Runs automatically whenever
+  // Look up the village name from a 6-digit pincode using the local
+  // Maharashtra pincode directory (bundled in pincodeData.json — no network
+  // call, so this works even with no internet). Runs automatically whenever
   // form.pincode becomes a valid 6-digit number (typed manually or filled by
-  // the card scan below), debounced so it doesn't fire on every keystroke.
+  // the card scan above), debounced so it doesn't fire on every keystroke.
+  // Many pincodes cover several villages; when that happens we try to match
+  // whatever village text the OCR pass already read off the card, and
+  // otherwise ask the person to pick from the candidates below.
   useEffect(() => {
     const pin = (form.pincode || "").trim();
     if (!/^[1-9]\d{5}$/.test(pin)) {
       setPincodeStatus(null);
+      setVillageCandidates([]);
       return;
     }
     let cancelled = false;
     setPincodeStatus("loading");
     const t = setTimeout(async () => {
       try {
-        const url = `https://api.data.gov.in/resource/${PINCODE_RESOURCE_ID}?api-key=${PINCODE_API_KEY}&format=json&limit=1&filters[pincode]=${pin}`;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error("lookup failed");
-        const data = await res.json();
-        const rec = data?.records?.[0];
+        const entry = await lookupPincode(pin);
         if (cancelled) return;
-        if (rec) {
-          const raw = (rec.officename || rec.village || rec.district || "").trim();
-          const villageName = raw.replace(/\s+(S\.?O|B\.?O|H\.?O)$/i, "").trim();
-          if (villageName) {
-            setForm((f) => (f.pincode.trim() === pin ? { ...f, village: villageName.toUpperCase() } : f));
-            setScanFilled((s) => (s ? { ...s, village: false } : s));
-          }
-          setPincodeStatus(villageName ? "done" : "error");
-        } else {
+        if (!entry || entry.villages.length === 0) {
           setPincodeStatus("error");
+          setVillageCandidates([]);
+          return;
+        }
+        setVillageCandidates(entry.villages);
+        const guessed = entry.villages.length === 1
+          ? entry.villages[0]
+          : pickBestVillage(entry.villages, ocrVillageGuessRef.current);
+        if (guessed) {
+          setForm((f) => (f.pincode.trim() === pin ? { ...f, village: guessed.toUpperCase() } : f));
+          setScanFilled((s) => (s ? { ...s, village: false } : s));
+          setPincodeStatus("done");
+        } else {
+          setPincodeStatus("multiple");
         }
       } catch (err) {
         if (!cancelled) setPincodeStatus("error");
       }
-    }, 500);
+    }, 400);
     return () => { cancelled = true; clearTimeout(t); };
   }, [form.pincode]);
 
@@ -471,6 +536,15 @@ function CardRegister() {
     customers.forEach((c) => { if (c.village) names.add(c.village); });
     return Array.from(names).sort();
   }, [villages, customers]);
+
+  // For the open form's datalist, also surface villages that share the
+  // currently-entered pincode (even if no one has used them here before) so
+  // the "multiple villages, please pick one" case is actually pickable.
+  const villageOptions = useMemo(() => {
+    const names = new Set(allVillageNames);
+    villageCandidates.forEach((v) => names.add(v.toUpperCase()));
+    return Array.from(names).sort();
+  }, [allVillageNames, villageCandidates]);
 
   const catMeta = (key) => CATEGORIES.find((c) => c.key === key) || CATEGORIES[0];
 
@@ -881,6 +955,11 @@ function CardRegister() {
               {pincodeStatus === "error" && (
                 <div style={{ fontSize: 11.5, color: "#A6234A", marginTop: 4 }}>Couldn't find that pincode — enter village manually.</div>
               )}
+              {pincodeStatus === "multiple" && (
+                <div style={{ fontSize: 11.5, color: "#B8860B", marginTop: 4 }}>
+                  {villageCandidates.length} villages share this pincode — pick the correct one below.
+                </div>
+              )}
             </Field>
 
             <Field label="Village" error={errors.village}>
@@ -892,7 +971,7 @@ function CardRegister() {
                 style={{ ...inputStyle(errors.village), ...(scanFilled?.village ? scannedFieldStyle : {}) }}
               />
               <datalist id="village-options">
-                {allVillageNames.map((name) => <option key={name} value={name} />)}
+                {villageOptions.map((name) => <option key={name} value={name} />)}
               </datalist>
             </Field>
 
